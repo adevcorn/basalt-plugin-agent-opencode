@@ -164,6 +164,29 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+fn extract_opencode_error(val: &serde_json::Value, part_obj: Option<&serde_json::Value>) -> String {
+    let candidate = part_obj
+        .and_then(|p| p.get("error").or_else(|| p.get("message")))
+        .or_else(|| val.get("error").or_else(|| val.get("message")));
+
+    if let Some(err_val) = candidate {
+        if let Some(s) = err_val.as_str() {
+            return s.to_string();
+        }
+        if let Some(msg) = err_val.get("data").and_then(|d| d.get("message")).and_then(|m| m.as_str()) {
+            return msg.to_string();
+        }
+        if let Some(msg) = err_val.get("message").and_then(|m| m.as_str()) {
+            return msg.to_string();
+        }
+        if let Some(name) = err_val.get("name").and_then(|n| n.as_str()) {
+            return name.to_string();
+        }
+        return err_val.to_string();
+    }
+    "Unknown error".to_string()
+}
+
 pub fn parse_opencode_json_line(line_str: &str) -> Vec<AgentEvent> {
     let mut events = Vec::new();
 
@@ -330,20 +353,40 @@ pub fn parse_opencode_json_line(line_str: &str) -> Vec<AgentEvent> {
                 .and_then(|r| r.as_str())
                 .unwrap_or("stop");
             let is_success = reason != "error" && reason != "cancelled" && reason != "failed";
-            let error = part_obj
-                .and_then(|p| p.get("error"))
-                .or_else(|| val.get("error"))
-                .and_then(|e| e.as_str().map(|s| s.to_string()).or_else(|| e.get("message").and_then(|m| m.as_str()).map(|s| s.to_string())));
+            let error = if !is_success {
+                let err_msg = extract_opencode_error(&val, part_obj);
+                if err_msg != "Unknown error" {
+                    Some(err_msg)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(ref err) = error {
+                let cleaned = strip_ansi(err);
+                events.push(AgentEvent::NewEntry {
+                    vendor_id: format!("err-{}", cleaned.len()),
+                    tool: cleaned.chars().take(80).collect(),
+                    category: "message".into(),
+                    raw_cmd: cleaned.clone(),
+                    file_paths: Vec::new(),
+                });
+            }
             events.push(AgentEvent::SessionEnded { success: is_success, error });
         } else if event_type == "error" {
-            let err_msg = part_obj
-                .and_then(|p| p.get("message").or_else(|| p.get("error")))
-                .or_else(|| val.get("message").or_else(|| val.get("error")))
-                .and_then(|e| e.as_str())
-                .unwrap_or("Unknown error");
+            let err_msg = extract_opencode_error(&val, part_obj);
+            let cleaned = strip_ansi(&err_msg);
+            events.push(AgentEvent::NewEntry {
+                vendor_id: format!("err-{}", cleaned.len()),
+                tool: cleaned.chars().take(80).collect(),
+                category: "message".into(),
+                raw_cmd: cleaned.clone(),
+                file_paths: Vec::new(),
+            });
             events.push(AgentEvent::SessionEnded {
                 success: false,
-                error: Some(err_msg.to_string()),
+                error: Some(cleaned),
             });
         } else {
             // Fallback for general text/message
@@ -499,6 +542,22 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_opencode_launch_no_disabled_tools() {
+        let req = AgentLaunchRequest {
+            mcp_url: Some("http://127.0.0.1:9999".into()),
+            disabled_tools: Vec::new(),
+            model: None,
+            variant: None,
+        };
+
+        let prep = prepare_opencode_launch(&req);
+        assert_eq!(prep.workspace_files.len(), 1);
+        let json_val: serde_json::Value = serde_json::from_str(&prep.workspace_files[0].content).unwrap();
+        assert_eq!(json_val["mcp"]["basalt"]["url"], "http://127.0.0.1:9999");
+        assert!(json_val.get("permission").is_none());
+    }
+
+    #[test]
     fn test_parse_basalt_tools_categorization() {
         let read_json = r#"{"type":"tool_use","part":{"type":"tool","tool":"basalt_read_file","callID":"c2","state":{"status":"completed","input":{"path":"Cargo.toml"}}}}"#;
         let evs = parse_opencode_json_line(read_json);
@@ -518,6 +577,27 @@ mod tests {
                 assert_eq!(category, "write");
             }
             _ => panic!("expected NewEntry for basalt_write_file"),
+        }
+    }
+
+    #[test]
+    fn test_parse_opencode_error_event() {
+        let error_json = r#"{"type":"error","timestamp":1789811125144,"sessionID":"ses_f46f1a177ffeCfJ0PC2BN32wdK","error":{"name":"APIError","data":{"message":"Error from provider (Console): OpenCode's free tier can only be used from within OpenCode","statusCode":403}}}"#;
+        let evs = parse_opencode_json_line(error_json);
+        assert_eq!(evs.len(), 2);
+        match &evs[0] {
+            AgentEvent::NewEntry { category, raw_cmd, .. } => {
+                assert_eq!(category, "message");
+                assert!(raw_cmd.contains("OpenCode's free tier can only be used from within OpenCode"));
+            }
+            _ => panic!("expected NewEntry with error message"),
+        }
+        match &evs[1] {
+            AgentEvent::SessionEnded { success, error } => {
+                assert!(!success);
+                assert!(error.as_ref().unwrap().contains("OpenCode's free tier can only be used from within OpenCode"));
+            }
+            _ => panic!("expected SessionEnded with error"),
         }
     }
 }
