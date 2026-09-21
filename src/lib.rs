@@ -187,11 +187,19 @@ fn extract_opencode_error(val: &serde_json::Value, part_obj: Option<&serde_json:
     "Unknown error".to_string()
 }
 
-pub fn parse_opencode_json_line(line_str: &str) -> Vec<AgentEvent> {
+/// State byte flags threaded through `basalt_agent_parse_line`.
+const STATE_NONE: u8 = 0;
+const STATE_MSG_OPEN: u8 = 1;
+const STATE_THOUGHT_OPEN: u8 = 2;
+
+static OPEN_TOOLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Stateful parse: processes one JSON line and returns `(new_state, events)`.
+pub fn parse_opencode_line_stateful(line_str: &str, open_entry: u8) -> (u8, Vec<AgentEvent>) {
     let mut events = Vec::new();
 
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(line_str) {
-        let part_obj = val.get("part");
+        let part_obj = val.get("part").or_else(|| val.get("data"));
         let event_type = val.get("type")
             .and_then(|t| t.as_str())
             .unwrap_or_else(|| {
@@ -199,37 +207,103 @@ pub fn parse_opencode_json_line(line_str: &str) -> Vec<AgentEvent> {
             });
 
         // 1. Session start / ID availability
-        if event_type == "step_start" || event_type == "step-start"
+        if event_type == "step_start" || event_type == "step-start" || event_type == "session_start" || event_type == "session-start"
             || part_obj.and_then(|p| p.get("type")).and_then(|t| t.as_str()) == Some("step-start")
         {
-            if let Some(sid) = val.get("sessionID").or_else(|| val.get("sessionId")).or_else(|| val.get("session_id")).and_then(|s| s.as_str()) {
+            if let Ok(mut set) = OPEN_TOOLS.lock() {
+                set.clear();
+            }
+            if let Some(sid) = val.get("sessionID")
+                .or_else(|| val.get("sessionId"))
+                .or_else(|| val.get("session_id"))
+                .or_else(|| part_obj.and_then(|p| p.get("sessionID").or_else(|| p.get("sessionId")).or_else(|| p.get("session_id"))))
+                .and_then(|s| s.as_str())
+            {
                 events.push(AgentEvent::SessionIDAvailable(sid.to_string()));
             }
-            return events;
+            return (STATE_NONE, events);
         }
 
         // 2. Tool Call / Tool Use
         if event_type == "tool_call" || event_type == "tool_use" || event_type == "call"
             || part_obj.and_then(|p| p.get("type")).and_then(|t| t.as_str()) == Some("tool")
         {
-            let tool_name = part_obj
-                .and_then(|p| p.get("tool").or_else(|| p.get("name")))
-                .or_else(|| val.get("tool").or_else(|| val.get("name")))
-                .and_then(|t| t.as_str())
-                .unwrap_or("tool");
+            let raw_tool_name = part_obj
+                .and_then(|p| p.get("tool").or_else(|| p.get("name")).or_else(|| p.get("tool_name")))
+                .or_else(|| val.get("tool").or_else(|| val.get("name")).or_else(|| val.get("tool_name")))
+                .and_then(|t| t.as_str());
+
+            // If neither part nor top-level specifies a tool name or part type, this is a generic container header object (e.g. {"type":"tool_use", "sessionID":"..."}).
+            if raw_tool_name.is_none() && part_obj.is_none() {
+                if let Some(sid) = val.get("sessionID").or_else(|| val.get("sessionId")).or_else(|| val.get("session_id")).and_then(|s| s.as_str()) {
+                    events.push(AgentEvent::SessionIDAvailable(sid.to_string()));
+                }
+                return (STATE_NONE, events);
+            }
+
+            let tool_name = raw_tool_name.unwrap_or("tool");
 
             let call_id = part_obj
-                .and_then(|p| p.get("callID").or_else(|| p.get("id")))
-                .or_else(|| val.get("id").or_else(|| val.get("call_id")))
+                .and_then(|p| p.get("callID").or_else(|| p.get("id")).or_else(|| p.get("call_id")))
+                .or_else(|| val.get("callID").or_else(|| val.get("id")).or_else(|| val.get("call_id")))
                 .and_then(|i| i.as_str())
                 .unwrap_or("call");
 
-            let lower = tool_name.to_lowercase();
+            let state_obj = part_obj.and_then(|p| p.get("state"));
+            let input_val = state_obj
+                .and_then(|s| s.get("input").or_else(|| s.get("args")).or_else(|| s.get("parameters")))
+                .or_else(|| part_obj.and_then(|p| p.get("input").or_else(|| p.get("args")).or_else(|| p.get("parameters"))))
+                .or_else(|| val.get("input").or_else(|| val.get("args")).or_else(|| val.get("parameters")));
+
+            // Unwrap MCP tool name if this is call_mcp_tool or if ToolName is specified in params
+            let mcp_tool_name = input_val
+                .and_then(|p| p.get("ToolName").or_else(|| p.get("tool_name")).or_else(|| p.get("tool")))
+                .and_then(|t| t.as_str());
+
+            let display_tool_name = if let Some(mcp) = mcp_tool_name {
+                mcp
+            } else {
+                tool_name
+            };
+
+            let actual_command = if let Some(args) = input_val {
+                let args_obj = args.get("Arguments").or_else(|| args.get("arguments")).unwrap_or(args);
+                args_obj.get("CommandLine")
+                    .or_else(|| args_obj.get("command_line"))
+                    .or_else(|| args_obj.get("command"))
+                    .or_else(|| args_obj.get("cmd"))
+                    .or_else(|| args_obj.get("script"))
+                    .and_then(|c| c.as_str())
+            } else {
+                None
+            };
+
+            let entry_tool_name = if (display_tool_name == "run_command"
+                || display_tool_name == "run_shell_command"
+                || display_tool_name == "bash"
+                || display_tool_name == "exec"
+                || display_tool_name == "run")
+                && actual_command.map_or(false, |c| !c.trim().is_empty())
+            {
+                actual_command.unwrap().to_string()
+            } else {
+                display_tool_name.to_string()
+            };
+
+            let lower = display_tool_name.to_lowercase();
             let category = if lower.contains("read") || lower.contains("view") {
                 "read"
-            } else if lower.contains("write") || lower.contains("edit") || lower.contains("replace") {
+            } else if lower.contains("write") || lower.contains("edit") || lower.contains("replace") || lower.contains("lease") {
                 "write"
-            } else if lower.contains("bash") || lower.contains("run") || lower.contains("exec") {
+            } else if lower.contains("test") {
+                "test"
+            } else if lower.contains("build") || lower.contains("compile") {
+                "build"
+            } else if lower.contains("git") {
+                "git"
+            } else if lower.contains("search") || lower.contains("grep") || lower.contains("find") || lower.contains("glob") {
+                "search"
+            } else if lower.contains("run") || lower.contains("bash") || lower.contains("exec") || lower.contains("command") {
                 "run"
             } else if lower.contains("ask") || lower.contains("question") {
                 "question"
@@ -237,50 +311,113 @@ pub fn parse_opencode_json_line(line_str: &str) -> Vec<AgentEvent> {
                 "run"
             };
 
-            let state_obj = part_obj.and_then(|p| p.get("state"));
-            let input_val = state_obj
-                .and_then(|s| s.get("input"))
-                .or_else(|| part_obj.and_then(|p| p.get("input").or_else(|| p.get("args"))))
-                .or_else(|| val.get("input").or_else(|| val.get("args")));
+            let raw_cmd = if let Some(args) = input_val.and_then(|p| p.get("Arguments").or_else(|| p.get("arguments"))) {
+                args.to_string()
+            } else {
+                input_val.map(|a| a.to_string()).unwrap_or_default()
+            };
 
-            let raw_cmd = input_val.map(|a| a.to_string()).unwrap_or_default();
             let mut file_paths = Vec::new();
             if let Some(args) = input_val {
-                if let Some(path) = args.get("filePath")
-                    .or_else(|| args.get("path"))
-                    .or_else(|| args.get("file_path"))
-                    .or_else(|| args.get("file"))
+                let args_obj = args.get("Arguments").or_else(|| args.get("arguments")).unwrap_or(args);
+                if let Some(path) = args_obj.get("filePath")
+                    .or_else(|| args_obj.get("path"))
+                    .or_else(|| args_obj.get("file_path"))
+                    .or_else(|| args_obj.get("file"))
+                    .or_else(|| args_obj.get("target_file"))
+                    .or_else(|| args_obj.get("TargetFile"))
                     .and_then(|p| p.as_str())
                 {
                     file_paths.push(path.to_string());
                 }
+                if let Some(paths) = args_obj.get("paths").and_then(|p| p.as_array()) {
+                    for path in paths.iter().filter_map(|p| p.as_str()) {
+                        file_paths.push(path.to_string());
+                    }
+                }
             }
 
+            let status_str = state_obj
+                .and_then(|s| s.get("status").or_else(|| s.get("state")))
+                .or_else(|| part_obj.and_then(|p| p.get("status").or_else(|| p.get("state"))))
+                .or_else(|| val.get("status").or_else(|| val.get("state")))
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+
             let output_str = state_obj
-                .and_then(|s| s.get("output"))
+                .and_then(|s| s.get("output").or_else(|| s.get("result")))
                 .or_else(|| part_obj.and_then(|p| p.get("output").or_else(|| p.get("result"))))
                 .or_else(|| val.get("output").or_else(|| val.get("result")))
                 .and_then(|o| o.as_str());
 
-            events.push(AgentEvent::NewEntry {
-                vendor_id: call_id.to_string(),
-                tool: tool_name.to_string(),
-                category: category.to_string(),
-                raw_cmd,
-                file_paths,
-            });
+            let is_completed = status_str == "completed"
+                || status_str == "done"
+                || status_str == "success"
+                || status_str == "finished"
+                || output_str.is_some();
 
-            if let Some(output) = output_str {
-                let lines: Vec<String> = output.lines().map(|l| strip_ansi(l)).collect();
+            if !is_completed {
+                let is_new = {
+                    let mut open = OPEN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+                    if !open.contains(&call_id.to_string()) {
+                        open.push(call_id.to_string());
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                if is_new {
+                    events.push(AgentEvent::NewEntry {
+                        vendor_id: call_id.to_string(),
+                        tool: entry_tool_name,
+                        category: category.to_string(),
+                        raw_cmd,
+                        file_paths,
+                    });
+                }
+            } else {
+                let was_open = {
+                    let mut open = OPEN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(pos) = open.iter().position(|x| x == call_id) {
+                        open.swap_remove(pos);
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                if !was_open {
+                    events.push(AgentEvent::NewEntry {
+                        vendor_id: call_id.to_string(),
+                        tool: entry_tool_name,
+                        category: category.to_string(),
+                        raw_cmd,
+                        file_paths,
+                    });
+                }
+
+                let exit_code = val.get("exit_code")
+                    .or_else(|| part_obj.and_then(|p| p.get("exit_code")))
+                    .or_else(|| state_obj.and_then(|s| s.get("exit_code")))
+                    .and_then(|c| c.as_i64())
+                    .unwrap_or(0) as i32;
+
+                let lines: Vec<String> = output_str
+                    .map(|o| o.lines().map(strip_ansi).collect())
+                    .unwrap_or_default();
+
                 events.push(AgentEvent::CloseEntry {
                     vendor_id: call_id.to_string(),
-                    exit_code: 0,
+                    exit_code,
                     output_lines: lines,
                 });
             }
-        } else if event_type == "tool_result" || event_type == "result" {
+
+            return (STATE_NONE, events);
+        } else if event_type == "tool_result" || (event_type == "result" && part_obj.and_then(|p| p.get("tool")).is_some()) {
             let call_id = part_obj
-                .and_then(|p| p.get("callID").or_else(|| p.get("id")))
+                .and_then(|p| p.get("callID").or_else(|| p.get("id")).or_else(|| p.get("call_id")))
                 .or_else(|| val.get("id").or_else(|| val.get("call_id")))
                 .and_then(|i| i.as_str())
                 .unwrap_or("call");
@@ -290,12 +427,21 @@ pub fn parse_opencode_json_line(line_str: &str) -> Vec<AgentEvent> {
                 .and_then(|o| o.as_str())
                 .unwrap_or("");
             let exit_code = val.get("exit_code").and_then(|c| c.as_i64()).unwrap_or(0) as i32;
-            let lines: Vec<String> = output.lines().map(|l| strip_ansi(l)).collect();
+            let lines: Vec<String> = output.lines().map(strip_ansi).collect();
+
+            {
+                let mut open = OPEN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(pos) = open.iter().position(|x| x == call_id) {
+                    open.swap_remove(pos);
+                }
+            }
+
             events.push(AgentEvent::CloseEntry {
                 vendor_id: call_id.to_string(),
                 exit_code,
                 output_lines: lines,
             });
+            return (STATE_NONE, events);
         } else if event_type == "question" || event_type == "ask" {
             let q_id = val.get("id").and_then(|i| i.as_str()).unwrap_or("question");
             let text = val.get("text").or_else(|| val.get("question")).or_else(|| val.get("message")).and_then(|t| t.as_str()).unwrap_or("");
@@ -306,6 +452,7 @@ pub fn parse_opencode_json_line(line_str: &str) -> Vec<AgentEvent> {
                 raw_cmd: text.to_string(),
                 file_paths: Vec::new(),
             });
+            return (STATE_NONE, events);
         } else if event_type == "reasoning" || event_type == "thought" || event_type == "thinking"
             || part_obj.and_then(|p| p.get("type")).and_then(|t| t.as_str()) == Some("reasoning")
             || part_obj.and_then(|p| p.get("type")).and_then(|t| t.as_str()) == Some("thought")
@@ -317,14 +464,23 @@ pub fn parse_opencode_json_line(line_str: &str) -> Vec<AgentEvent> {
                 .unwrap_or("");
             let cleaned = strip_ansi(text);
             if !cleaned.trim().is_empty() {
-                events.push(AgentEvent::NewEntry {
-                    vendor_id: format!("thought-{}", cleaned.len()),
-                    tool: cleaned.chars().take(80).collect(),
-                    category: "thought".into(),
-                    raw_cmd: cleaned,
-                    file_paths: Vec::new(),
-                });
+                if open_entry == STATE_THOUGHT_OPEN {
+                    events.push(AgentEvent::AppendToEntry {
+                        vendor_id: "agent-thought".to_string(),
+                        text: cleaned,
+                    });
+                } else {
+                    events.push(AgentEvent::NewEntry {
+                        vendor_id: "agent-thought".to_string(),
+                        tool: cleaned.chars().take(80).collect(),
+                        category: "thought".into(),
+                        raw_cmd: cleaned,
+                        file_paths: Vec::new(),
+                    });
+                }
+                return (STATE_THOUGHT_OPEN, events);
             }
+            return (open_entry, events);
         } else if event_type == "text" || event_type == "message" || event_type == "content"
             || part_obj.and_then(|p| p.get("type")).and_then(|t| t.as_str()) == Some("text")
         {
@@ -335,14 +491,23 @@ pub fn parse_opencode_json_line(line_str: &str) -> Vec<AgentEvent> {
                 .unwrap_or("");
             let cleaned = strip_ansi(text);
             if !cleaned.trim().is_empty() {
-                events.push(AgentEvent::NewEntry {
-                    vendor_id: format!("msg-{}", cleaned.len()),
-                    tool: cleaned.chars().take(80).collect(),
-                    category: "message".into(),
-                    raw_cmd: cleaned,
-                    file_paths: Vec::new(),
-                });
+                if open_entry == STATE_MSG_OPEN {
+                    events.push(AgentEvent::AppendToEntry {
+                        vendor_id: "agent-response".to_string(),
+                        text: cleaned,
+                    });
+                } else {
+                    events.push(AgentEvent::NewEntry {
+                        vendor_id: "agent-response".to_string(),
+                        tool: cleaned.chars().take(80).collect(),
+                        category: "message".into(),
+                        raw_cmd: cleaned,
+                        file_paths: Vec::new(),
+                    });
+                }
+                return (STATE_MSG_OPEN, events);
             }
+            return (open_entry, events);
         } else if event_type == "done" || event_type == "complete" || event_type == "finish"
             || event_type == "step_finish" || event_type == "step-finish"
             || part_obj.and_then(|p| p.get("type")).and_then(|t| t.as_str()) == Some("step-finish")
@@ -374,6 +539,7 @@ pub fn parse_opencode_json_line(line_str: &str) -> Vec<AgentEvent> {
                 });
             }
             events.push(AgentEvent::SessionEnded { success: is_success, error });
+            return (STATE_NONE, events);
         } else if event_type == "error" {
             let err_msg = extract_opencode_error(&val, part_obj);
             let cleaned = strip_ansi(&err_msg);
@@ -388,20 +554,30 @@ pub fn parse_opencode_json_line(line_str: &str) -> Vec<AgentEvent> {
                 success: false,
                 error: Some(cleaned),
             });
+            return (STATE_NONE, events);
         } else {
-            // Fallback for general text/message
-            if let Some(text) = part_obj.and_then(|p| p.get("text")).or_else(|| val.get("text")).or_else(|| val.get("message")).or_else(|| val.get("data")).and_then(|t| t.as_str()) {
+            // Unrecognized JSON object - check for explicit message text; otherwise ignore metadata objects to avoid polluting chat log with raw JSON strings.
+            if let Some(text) = part_obj.and_then(|p| p.get("text")).or_else(|| val.get("text")).or_else(|| val.get("message")).and_then(|t| t.as_str()) {
                 let cleaned = strip_ansi(text);
                 if !cleaned.trim().is_empty() {
+                    if open_entry == STATE_MSG_OPEN {
+                        events.push(AgentEvent::AppendToEntry {
+                            vendor_id: "agent-response".to_string(),
+                            text: cleaned,
+                        });
+                        return (STATE_MSG_OPEN, events);
+                    }
                     events.push(AgentEvent::NewEntry {
-                        vendor_id: format!("data-{}", cleaned.len()),
+                        vendor_id: format!("msg-{}", cleaned.len()),
                         tool: cleaned.chars().take(80).collect(),
-                        category: "log".into(),
+                        category: "message".into(),
                         raw_cmd: cleaned,
                         file_paths: Vec::new(),
                     });
+                    return (STATE_MSG_OPEN, events);
                 }
             }
+            return (STATE_NONE, events);
         }
     } else {
         // Plain text fallback with ANSI stripped
@@ -424,15 +600,19 @@ pub fn parse_opencode_json_line(line_str: &str) -> Vec<AgentEvent> {
         }
     }
 
-    events
+    (STATE_NONE, events)
+}
+
+pub fn parse_opencode_json_line(line_str: &str) -> Vec<AgentEvent> {
+    parse_opencode_line_stateful(line_str, STATE_NONE).1
 }
 
 #[no_mangle]
 pub extern "C" fn basalt_agent_parse_line(
     line_ptr: *const u8,
     line_len: u32,
-    _state_ptr: *const u8,
-    _state_len: u32,
+    state_ptr: *const u8,
+    state_len: u32,
 ) -> u64 {
     if line_ptr.is_null() || line_len == 0 {
         return pack_output(encode_agent_parse_output(&[], &[]));
@@ -447,8 +627,15 @@ pub extern "C" fn basalt_agent_parse_line(
         return pack_output(encode_agent_parse_output(&[], &[]));
     }
 
-    let events = parse_opencode_json_line(line_str);
-    pack_output(encode_agent_parse_output(&[], &events))
+    let open_entry = if !state_ptr.is_null() && state_len > 0 {
+        let state_slice = unsafe { std::slice::from_raw_parts(state_ptr, state_len as usize) };
+        state_slice[0]
+    } else {
+        STATE_NONE
+    };
+
+    let (new_state, events) = parse_opencode_line_stateful(line_str, open_entry);
+    pack_output(encode_agent_parse_output(&[new_state], &events))
 }
 
 #[cfg(test)]
@@ -528,6 +715,7 @@ mod tests {
             disabled_tools: vec![StandardTool::Read, StandardTool::Write],
             model: None,
             variant: None,
+            workspace_path: None,
         };
 
         let prep = prepare_opencode_launch(&req);
@@ -548,6 +736,7 @@ mod tests {
             disabled_tools: Vec::new(),
             model: None,
             variant: None,
+            workspace_path: None,
         };
 
         let prep = prepare_opencode_launch(&req);
@@ -578,6 +767,26 @@ mod tests {
             }
             _ => panic!("expected NewEntry for basalt_write_file"),
         }
+
+        let test_json = r#"{"type":"tool_use","part":{"type":"tool","tool":"run_cargo_test","callID":"c4","state":{"status":"completed","input":{"args":"--all"}}}}"#;
+        let evs = parse_opencode_json_line(test_json);
+        match &evs[0] {
+            AgentEvent::NewEntry { tool, category, .. } => {
+                assert_eq!(tool, "run_cargo_test");
+                assert_eq!(category, "test");
+            }
+            _ => panic!("expected NewEntry for run_cargo_test"),
+        }
+
+        let git_json = r#"{"type":"tool_use","part":{"type":"tool","tool":"git_diff","callID":"c5","state":{"status":"completed","input":{}}}}"#;
+        let evs = parse_opencode_json_line(git_json);
+        match &evs[0] {
+            AgentEvent::NewEntry { tool, category, .. } => {
+                assert_eq!(tool, "git_diff");
+                assert_eq!(category, "git");
+            }
+            _ => panic!("expected NewEntry for git_diff"),
+        }
     }
 
     #[test]
@@ -598,6 +807,113 @@ mod tests {
                 assert!(error.as_ref().unwrap().contains("OpenCode's free tier can only be used from within OpenCode"));
             }
             _ => panic!("expected SessionEnded with error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_container_header_filtering() {
+        // Container header object with sessionID but no part / tool payload should emit SessionIDAvailable, not raw chat line.
+        let header_json = r#"{"type":"tool_use","timestamp":1789969295278,"sessionID":"ses_f3d8449e7ffegh"}"#;
+        let evs = parse_opencode_json_line(header_json);
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            AgentEvent::SessionIDAvailable(sid) => assert_eq!(sid, "ses_f3d8449e7ffegh"),
+            _ => panic!("expected SessionIDAvailable for container header"),
+        }
+    }
+
+    #[test]
+    fn test_parse_mcp_and_command_unwrapping() {
+        // MCP tool unwrapping
+        let mcp_json = r#"{"type":"tool_use","part":{"type":"tool","tool":"call_mcp_tool","callID":"c_mcp1","status":"completed","input":{"ToolName":"write_file","Arguments":{"path":"src/lib.rs"}},"output":"Written"}}"#;
+        let evs = parse_opencode_json_line(mcp_json);
+        assert_eq!(evs.len(), 2);
+        match &evs[0] {
+            AgentEvent::NewEntry { tool, category, file_paths, .. } => {
+                assert_eq!(tool, "write_file");
+                assert_eq!(category, "write");
+                assert_eq!(file_paths, &vec!["src/lib.rs".to_string()]);
+            }
+            _ => panic!("expected NewEntry for MCP tool"),
+        }
+
+        // Command line unwrapping
+        let cmd_json = r#"{"type":"tool_use","part":{"type":"tool","tool":"run_command","callID":"c_cmd1","status":"completed","input":{"CommandLine":"cargo check --workspace"},"output":"ok"}}"#;
+        let evs = parse_opencode_json_line(cmd_json);
+        assert_eq!(evs.len(), 2);
+        match &evs[0] {
+            AgentEvent::NewEntry { tool, category, .. } => {
+                assert_eq!(tool, "cargo check --workspace");
+                assert_eq!(category, "run");
+            }
+            _ => panic!("expected NewEntry for command tool"),
+        }
+    }
+
+    #[test]
+    fn test_stateful_streaming_deltas() {
+        let (st1, evs1) = parse_opencode_line_stateful(
+            r#"{"type":"text","part":{"type":"text","text":"Hello "}}"#,
+            STATE_NONE,
+        );
+        assert_eq!(st1, STATE_MSG_OPEN);
+        assert_eq!(evs1.len(), 1);
+        match &evs1[0] {
+            AgentEvent::NewEntry { category, raw_cmd, .. } => {
+                assert_eq!(category, "message");
+                assert_eq!(raw_cmd, "Hello ");
+            }
+            _ => panic!("expected NewEntry for first message delta"),
+        }
+
+        let (st2, evs2) = parse_opencode_line_stateful(
+            r#"{"type":"text","part":{"type":"text","text":"world!"}}"#,
+            st1,
+        );
+        assert_eq!(st2, STATE_MSG_OPEN);
+        assert_eq!(evs2.len(), 1);
+        match &evs2[0] {
+            AgentEvent::AppendToEntry { vendor_id, text } => {
+                assert_eq!(vendor_id, "agent-response");
+                assert_eq!(text, "world!");
+            }
+            _ => panic!("expected AppendToEntry for second message delta"),
+        }
+    }
+
+    #[test]
+    fn test_two_phase_tool_lifecycle() {
+        if let Ok(mut set) = OPEN_TOOLS.lock() {
+            set.clear();
+        }
+
+        // Phase 1: running
+        let active_json = r#"{"type":"tool_use","part":{"type":"tool","tool":"read","callID":"c_life1","status":"running","input":{"filePath":"src/main.rs"}}}"#;
+        let (st1, evs1) = parse_opencode_line_stateful(active_json, STATE_NONE);
+        assert_eq!(st1, STATE_NONE);
+        assert_eq!(evs1.len(), 1);
+        match &evs1[0] {
+            AgentEvent::NewEntry { vendor_id, tool, category, file_paths, .. } => {
+                assert_eq!(vendor_id, "c_life1");
+                assert_eq!(tool, "read");
+                assert_eq!(category, "read");
+                assert_eq!(file_paths, &vec!["src/main.rs".to_string()]);
+            }
+            _ => panic!("expected NewEntry for tool start"),
+        }
+
+        // Phase 2: completed
+        let completed_json = r#"{"type":"tool_use","part":{"type":"tool","tool":"read","callID":"c_life1","status":"completed","input":{"filePath":"src/main.rs"},"output":"fn main() {}"}}"#;
+        let (st2, evs2) = parse_opencode_line_stateful(completed_json, st1);
+        assert_eq!(st2, STATE_NONE);
+        assert_eq!(evs2.len(), 1);
+        match &evs2[0] {
+            AgentEvent::CloseEntry { vendor_id, exit_code, output_lines } => {
+                assert_eq!(vendor_id, "c_life1");
+                assert_eq!(*exit_code, 0);
+                assert_eq!(output_lines, &vec!["fn main() {}".to_string()]);
+            }
+            _ => panic!("expected CloseEntry for tool completion"),
         }
     }
 }
