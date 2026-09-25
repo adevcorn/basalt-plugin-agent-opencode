@@ -21,6 +21,53 @@ basalt_plugin_meta! {
     activation_events: "",
 }
 
+/// Launch-contract types shared with the Basalt host as JSON.
+///
+/// These mirror `basalt-core/src/agent_metadata.rs`. They intentionally live
+/// here (rather than in `basalt-plugin-sdk`, which no longer exports them) so
+/// the plugin stays self-contained and buildable against the current SDK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StandardTool {
+    Read,
+    Write,
+    Execute,
+    Question,
+}
+
+/// A single file to materialize into the agent's workspace before launch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentWorkspaceFile {
+    pub relative_path: String,
+    pub content: String,
+}
+
+/// Request passed (as JSON) to `basalt_agent_prepare_launch` by the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentLaunchRequest {
+    #[serde(default)]
+    pub mcp_url: Option<String>,
+    #[serde(default)]
+    pub disabled_tools: Vec<StandardTool>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub variant: Option<String>,
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+}
+
+/// Result of launch preparation: extra CLI args, env vars, and workspace files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentLaunchPreparation {
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub workspace_files: Vec<AgentWorkspaceFile>,
+}
+
 #[no_mangle]
 pub extern "C" fn basalt_agent_metadata() -> u64 {
     let meta = AgentMetadata {
@@ -30,7 +77,10 @@ pub extern "C" fn basalt_agent_metadata() -> u64 {
         resume_new_args: vec!["run".into(), "--format".into(), "json".into(), "--thinking".into(), "--auto".into(), "{prompt}".into()],
         resume_cont_args: vec!["run".into(), "--format".into(), "json".into(), "--thinking".into(), "--auto".into(), "--session".into(), "{session_id}".into(), "{prompt}".into()],
         execution_tier: AgentExecutionTier::StructuredDirect,
-        workspace_capabilities: vec!["mcp".into(), "shadow".into()],
+        // Declares the shadow config this agent needs; the host renders
+        // `.opencode/opencode.json` from the session MCP URL (plugin-wins
+        // on collision, so the hand-rolled file below keeps priority).
+        workspace_capabilities: vec!["mcp".into(), "shadow".into(), "config:opencode".into()],
         protocol: AgentProtocol::Cli,
     };
     let bytes = encode_agent_metadata(&meta);
@@ -39,21 +89,11 @@ pub extern "C" fn basalt_agent_metadata() -> u64 {
 
 #[no_mangle]
 pub extern "C" fn basalt_agent_settings_schema() -> u64 {
-    let schema = serde_json::json!({
-        "plugin": "opencode",
-        "dynamic_models": true,
-        "models_command": "opencode models",
-        "variants": [
-            "default",
-            "low",
-            "medium",
-            "high",
-            "max"
-        ],
-        "default_variant": "default"
-    });
-    let bytes = serde_json::to_vec(&schema).unwrap_or_default();
-    pack_output(bytes)
+    // The host decodes this export with the binary `encode_agent_settings_schema`
+    // wire format (see `basalt-plugin-sdk`), not JSON. Model discovery is done
+    // host-side via `fetch_agent_models` (`opencode models`), so no fields are
+    // needed here.
+    pack_output(encode_agent_settings_schema(&[]))
 }
 
 /// Pure implementation of OpenCode launch preparation for testability and guest execution.
@@ -291,7 +331,11 @@ pub fn parse_opencode_line_stateful(line_str: &str, open_entry: u8) -> (u8, Vec<
             };
 
             let lower = display_tool_name.to_lowercase();
-            let category = if lower.contains("read") || lower.contains("view") {
+            let category = if lower.contains("query_peer") || lower.contains("peer_symbol") || lower.contains("peer_file") {
+                "peer"
+            } else if lower == "task" || lower.contains("subagent") || lower.contains("delegate") {
+                "task"
+            } else if lower.contains("read") || lower.contains("view") {
                 "read"
             } else if lower.contains("write") || lower.contains("edit") || lower.contains("replace") || lower.contains("lease") {
                 "write"
@@ -517,16 +561,23 @@ pub fn parse_opencode_line_stateful(line_str: &str, open_entry: u8) -> (u8, Vec<
                 .or_else(|| val.get("reason"))
                 .and_then(|r| r.as_str())
                 .unwrap_or("stop");
-            let is_success = reason != "error" && reason != "cancelled" && reason != "failed";
-            let error = if !is_success {
+            // A step boundary is NOT a turn boundary: `opencode run` streams
+            // many steps per run (one per tool-call batch) and only exits the
+            // process when the run is over. Emitting SessionEnded here ended
+            // the turn (and SIGKILLed the child) at the first step. Terminal
+            // state comes from the process exit (poll_exits) or the error
+            // event below — so successful steps emit nothing.
+            let is_terminal = reason == "error" || reason == "cancelled" || reason == "failed";
+            if !is_terminal {
+                return (STATE_NONE, events);
+            }
+            let error = {
                 let err_msg = extract_opencode_error(&val, part_obj);
                 if err_msg != "Unknown error" {
                     Some(err_msg)
                 } else {
                     None
                 }
-            } else {
-                None
             };
             if let Some(ref err) = error {
                 let cleaned = strip_ansi(err);
@@ -538,7 +589,7 @@ pub fn parse_opencode_line_stateful(line_str: &str, open_entry: u8) -> (u8, Vec<
                     file_paths: Vec::new(),
                 });
             }
-            events.push(AgentEvent::SessionEnded { success: is_success, error });
+            events.push(AgentEvent::SessionEnded { success: false });
             return (STATE_NONE, events);
         } else if event_type == "error" {
             let err_msg = extract_opencode_error(&val, part_obj);
@@ -550,10 +601,7 @@ pub fn parse_opencode_line_stateful(line_str: &str, open_entry: u8) -> (u8, Vec<
                 raw_cmd: cleaned.clone(),
                 file_paths: Vec::new(),
             });
-            events.push(AgentEvent::SessionEnded {
-                success: false,
-                error: Some(cleaned),
-            });
+            events.push(AgentEvent::SessionEnded { success: false });
             return (STATE_NONE, events);
         } else {
             // Unrecognized JSON object - check for explicit message text; otherwise ignore metadata objects to avoid polluting chat log with raw JSON strings.
@@ -677,13 +725,19 @@ mod tests {
             _ => panic!("expected NewEntry with message"),
         }
 
-        // 4. step_finish (stop)
+        // 4. step_finish with a success reason is a mid-run step boundary,
+        // not a turn boundary: it must emit nothing (turn end comes from
+        // process exit or the error event). Only terminal reasons end it.
         let step_finish_json = r#"{"type":"step_finish","timestamp":1789240423264,"sessionID":"ses_f68f5f178ffeDT2AycolEs49NT","part":{"id":"prt_0970a3353001THyTdtCclTi8h0","reason":"stop","messageID":"msg_0970a1bc6001hi1gQHwzKhRJx8","sessionID":"ses_f68f5f178ffeDT2AycolEs49NT","type":"step-finish","tokens":{"total":7256,"input":7229,"output":3,"reasoning":24,"cache":{"write":0,"read":0}},"cost":0}}"#;
         let evs = parse_opencode_json_line(step_finish_json);
+        assert!(evs.is_empty(), "mid-run step must not end the turn");
+
+        let step_fail_json = r#"{"type":"step_finish","timestamp":1789240423264,"sessionID":"ses_f68f5f178ffeDT2AycolEs49NT","part":{"id":"prt_0970a3353001THyTdtCclTi8h0","reason":"failed","messageID":"msg_0970a1bc6001hi1gQHwzKhRJx8","sessionID":"ses_f68f5f178ffeDT2AycolEs49NT","type":"step-finish","tokens":{"total":7256,"input":7229,"output":3,"reasoning":24,"cache":{"write":0,"read":0}},"cost":0}}"#;
+        let evs = parse_opencode_json_line(step_fail_json);
         assert_eq!(evs.len(), 1);
         match &evs[0] {
-            AgentEvent::SessionEnded { success, error: _ } => assert!(success),
-            _ => panic!("expected SessionEnded"),
+            AgentEvent::SessionEnded { success } => assert!(!success),
+            _ => panic!("expected failed SessionEnded"),
         }
 
         // 5. completed tool call
@@ -787,6 +841,26 @@ mod tests {
             }
             _ => panic!("expected NewEntry for git_diff"),
         }
+
+        let peer_json = r#"{"type":"tool_use","part":{"type":"tool","tool":"basalt_query_peer_symbol","callID":"c6","state":{"status":"completed","input":{"peer_id":7,"symbol":"auth_v2"}}}}"#;
+        let evs = parse_opencode_json_line(peer_json);
+        match &evs[0] {
+            AgentEvent::NewEntry { tool, category, .. } => {
+                assert_eq!(tool, "basalt_query_peer_symbol");
+                assert_eq!(category, "peer");
+            }
+            _ => panic!("expected NewEntry for basalt_query_peer_symbol"),
+        }
+
+        let task_json = r#"{"type":"tool_use","part":{"type":"tool","tool":"task","callID":"c7","state":{"status":"completed","input":{"description":"explore auth module"}}}}"#;
+        let evs = parse_opencode_json_line(task_json);
+        match &evs[0] {
+            AgentEvent::NewEntry { tool, category, .. } => {
+                assert_eq!(tool, "task");
+                assert_eq!(category, "task");
+            }
+            _ => panic!("expected NewEntry for task"),
+        }
     }
 
     #[test]
@@ -802,11 +876,10 @@ mod tests {
             _ => panic!("expected NewEntry with error message"),
         }
         match &evs[1] {
-            AgentEvent::SessionEnded { success, error } => {
+            AgentEvent::SessionEnded { success } => {
                 assert!(!success);
-                assert!(error.as_ref().unwrap().contains("OpenCode's free tier can only be used from within OpenCode"));
             }
-            _ => panic!("expected SessionEnded with error"),
+            _ => panic!("expected SessionEnded with failure"),
         }
     }
 
