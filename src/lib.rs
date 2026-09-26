@@ -4,7 +4,6 @@
 //! discovery (`opencode models`) and effort variants (`low`, `medium`, `high`, `max`).
 
 use basalt_plugin_sdk::prelude::*;
-use basalt_host_shims as _;
 
 pub const PLUGIN_NAME: &str = "opencode";
 pub const PLUGIN_VERSION: &str = "0.1.0";
