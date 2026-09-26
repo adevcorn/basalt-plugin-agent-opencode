@@ -589,7 +589,7 @@ pub fn parse_opencode_line_stateful(line_str: &str, open_entry: u8) -> (u8, Vec<
                     file_paths: Vec::new(),
                 });
             }
-            events.push(AgentEvent::SessionEnded { success: false });
+            events.push(AgentEvent::SessionEnded { success: false, error });
             return (STATE_NONE, events);
         } else if event_type == "error" {
             let err_msg = extract_opencode_error(&val, part_obj);
@@ -601,7 +601,7 @@ pub fn parse_opencode_line_stateful(line_str: &str, open_entry: u8) -> (u8, Vec<
                 raw_cmd: cleaned.clone(),
                 file_paths: Vec::new(),
             });
-            events.push(AgentEvent::SessionEnded { success: false });
+            events.push(AgentEvent::SessionEnded { success: false, error: Some(cleaned) });
             return (STATE_NONE, events);
         } else {
             // Unrecognized JSON object - check for explicit message text; otherwise ignore metadata objects to avoid polluting chat log with raw JSON strings.
@@ -736,7 +736,7 @@ mod tests {
         let evs = parse_opencode_json_line(step_fail_json);
         assert_eq!(evs.len(), 1);
         match &evs[0] {
-            AgentEvent::SessionEnded { success } => assert!(!success),
+            AgentEvent::SessionEnded { success, .. } => assert!(!success),
             _ => panic!("expected failed SessionEnded"),
         }
 
@@ -876,7 +876,7 @@ mod tests {
             _ => panic!("expected NewEntry with error message"),
         }
         match &evs[1] {
-            AgentEvent::SessionEnded { success } => {
+            AgentEvent::SessionEnded { success, .. } => {
                 assert!(!success);
             }
             _ => panic!("expected SessionEnded with failure"),
