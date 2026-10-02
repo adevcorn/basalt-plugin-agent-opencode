@@ -67,6 +67,19 @@ pub struct AgentLaunchPreparation {
     pub workspace_files: Vec<AgentWorkspaceFile>,
 }
 
+/// Workspace capabilities declared to the host, including tool masks
+/// (`mask:<family>:<tool>=<policy>`) enforced host-side in tools/list
+/// filtering and opencode.json permissions.
+///
+/// Rationale for `mask:opencode:bash=ask`: raw shell is the observed bypass
+/// vector (agents shelling out for search/build instead of MCP tools), so
+/// `bash` requires approval while MCP `check` / `test` / `exec_with_effects`
+/// cover legitimate needs. Native `read`/`edit` stay allowed: exploration
+/// reads are harmless and the harness needs them for its own bookkeeping.
+fn declared_capabilities() -> Vec<String> {
+    vec!["mcp".into(), "shadow".into(), "config:opencode".into(), "mask:opencode:bash=ask".into()]
+}
+
 #[no_mangle]
 pub extern "C" fn basalt_agent_metadata() -> u64 {
     let meta = AgentMetadata {
@@ -76,10 +89,7 @@ pub extern "C" fn basalt_agent_metadata() -> u64 {
         resume_new_args: vec!["run".into(), "--format".into(), "json".into(), "--thinking".into(), "--auto".into(), "{prompt}".into()],
         resume_cont_args: vec!["run".into(), "--format".into(), "json".into(), "--thinking".into(), "--auto".into(), "--session".into(), "{session_id}".into(), "{prompt}".into()],
         execution_tier: AgentExecutionTier::StructuredDirect,
-        // Declares the shadow config this agent needs; the host renders
-        // `.opencode/opencode.json` from the session MCP URL (plugin-wins
-        // on collision, so the hand-rolled file below keeps priority).
-        workspace_capabilities: vec!["mcp".into(), "shadow".into(), "config:opencode".into()],
+        workspace_capabilities: declared_capabilities(),
         protocol: AgentProtocol::Cli,
     };
     let bytes = encode_agent_metadata(&meta);
@@ -783,8 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_opencode_launch_no_disabled_tools() {
-        let req = AgentLaunchRequest {
+    fn test_prepare_opencode_launch_no_disabled_tools() {        let req = AgentLaunchRequest {
             mcp_url: Some("http://127.0.0.1:9999".into()),
             disabled_tools: Vec::new(),
             model: None,
@@ -987,5 +996,27 @@ mod tests {
             }
             _ => panic!("expected CloseEntry for tool completion"),
         }
+    }
+
+    #[test]
+    fn test_declared_mask_capabilities_are_well_formed() {
+        // Contract with the host (basalt-core agent_metadata::parse_tool_masks):
+        // `mask:<family>:<tool>=<allow|deny|ask>`. The host enforces these in
+        // tools/list filtering and opencode.json permissions; malformed
+        // entries are silently skipped host-side, so assert exact form on the
+        // REAL declaration (not a copy).
+        let caps = declared_capabilities();
+        let mut saw_mask = false;
+        for cap in caps.iter().filter(|c| c.starts_with("mask:")) {
+            if *cap == "mask:opencode:bash=ask" {
+                saw_mask = true;
+            }
+            let rest = cap.strip_prefix("mask:").unwrap();
+            let (fam_tool, policy) = rest.split_once('=').expect("mask needs =policy");
+            let (family, tool) = fam_tool.split_once(':').expect("mask needs family:tool");
+            assert!(!family.is_empty() && !tool.is_empty());
+            assert!(["allow", "deny", "ask"].contains(&policy), "bad policy: {policy}");
+        }
+        assert!(saw_mask, "bash=ask mask must be declared");
     }
 }
