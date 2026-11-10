@@ -6,11 +6,11 @@
 use basalt_plugin_sdk::prelude::*;
 
 pub const PLUGIN_NAME: &str = "opencode";
-pub const PLUGIN_VERSION: &str = "0.1.0";
+pub const PLUGIN_VERSION: &str = "0.1.1";
 
 basalt_plugin_meta! {
     name:         "opencode",
-    version:      "0.1.0",
+    version:      "0.1.1",
     hook_flags:   CAP_AGENT_LAUNCHER,
     provides:     "agent-launcher@opencode/v1",
     requires:     "",
